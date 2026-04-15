@@ -95,11 +95,12 @@
   (vl-load-com)
   (setq result nil)
 
-  ;; Выбрать все объекты TEXT и MTEXT на чертеже
-  (setq ss (ssget "_X" '((0 . "TEXT,MTEXT"))))
+  ;; Пользователь выбирает нужные тексты вручную
+  (princ "\nВыберите текстовые объекты (рамкой или по одному), затем Enter: ")
+  (setq ss (ssget '((0 . "TEXT,MTEXT"))))
 
   (if (null ss)
-    (princ "\nSUM_PIPES: на чертеже не найдено текстовых объектов.")
+    (princ "\nSUM_PIPES: объекты не выбраны, команда отменена.")
     (progn
       (setq i 0)
       (repeat (sslength ss)
