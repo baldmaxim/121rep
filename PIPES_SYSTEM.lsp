@@ -1,37 +1,27 @@
 ;;; =============================================================
-;;; PIPES_SYSTEM.lsp  v1.0
-;;; Анализ холодильных систем: трубопроводы, рефнеты, блоки
+;;; PIPES_SYSTEM.lsp  v2.0
+;;; HVAC refrigerant system analyzer for AutoCAD
 ;;;
-;;; Что считает:
-;;;   НБ  — наружные блоки  (имя начинается с ARUN)
-;;;   ВБ  — внутренние блоки (имя начинается с IAC,  модель ARNU*)
-;;;   Рефнет — разветвители  (имя начинается с ARBLN)
-;;;   Труба  — длина по диаметру (метки над/под линиями)
+;;; Finds: ODU (ARUN*), IDU (IAC*/ARNU*), Refnets (ARBLN*),
+;;;        pipe lengths by diameter
+;;; Groups by system name from MTEXT near ODU block.
+;;; Traces connectivity via BFS (LINE/LWPOLYLINE/POLYLINE + blocks).
+;;; Exports to CSV (semicolon-separated, comma decimals for RU Excel).
 ;;;
-;;; Группировка по системам: имя берётся из MTEXT рядом с НБ,
-;;; строка «ID Оборудования : К1.ПК1-1-1».
-;;;
-;;; Трассировка: BFS от НБ по LINE / LWPOLYLINE / POLYLINE
-;;; и блокам ARBLN* / IAC* — всё, что геометрически соединено.
-;;;
-;;; Вывод: CSV файл (разделитель «;», десятичная «,»)
-;;;        — открывается в Excel без настроек (рус. локаль).
-;;;
-;;; Команда: PIPES_SYSTEM
+;;; Command: PIPES_SYSTEM
 ;;; =============================================================
 
 (vl-load-com)
 
-;;; ---- Настройки (меняй здесь при необходимости) ----
-(setq *PS:TOL*   3.0)    ; допуск «соединения» в единицах чертежа
-(setq *PS:MRAD* 600.0)   ; радиус поиска MTEXT у блока оборудования
-(setq *PS:PRAD* 200.0)   ; радиус поиска подписей диаметра/длины трубы
+;;; ---- Settings ----
+(setq *PS:TOL*   3.0)    ; connection tolerance (drawing units)
+(setq *PS:MRAD* 600.0)   ; MTEXT search radius near equipment block
+(setq *PS:PRAD* 200.0)   ; pipe label search radius
 
 ;;; ================================================================
-;;;  Строковые утилиты
+;;;  String utilities
 ;;; ================================================================
 
-;;; Убрать пробелы по краям
 (defun ps:trim (s / i)
   (if (null s) (setq s ""))
   (while (and (> (strlen s) 0) (= (substr s 1 1) " "))
@@ -40,52 +30,48 @@
     (setq s (substr s 1 (1- (strlen s)))))
   s)
 
-;;; Начинается ли строка с префикса (без учёта регистра)
+;;; starts-with (case-insensitive)
 (defun ps:sw (s pfx)
   (and (>= (strlen s) (strlen pfx))
        (= (strcase (substr s 1 (strlen pfx))) (strcase pfx))))
 
-;;; Разобрать MTEXT-строку: убрать RTF-коды, разбить по \P → список строк
+;;; Parse MTEXT raw string: strip RTF codes, split by \P -> list of lines
 (defun ps:mtext->lines (raw / lines cur i len ch)
   (setq raw   (if raw raw "")
         lines nil  cur ""  i 1  len (strlen raw))
   (while (<= i len)
     (setq ch (substr raw i 1))
     (cond
-      ;; Разрыв абзаца \P или \n
       ((and (= ch "\\") (<= (1+ i) len)
             (member (strcase (substr raw (1+ i) 1)) '("P" "N")))
        (if (> (strlen (ps:trim cur)) 0)
          (setq lines (append lines (list (ps:trim cur)))))
        (setq cur "" i (+ i 2)))
-      ;; RTF-код \X...;  — пропустить до «;»
       ((and (= ch "\\") (<= (1+ i) len)
             (not (member (strcase (substr raw (1+ i) 1)) '("P" "N" "~"))))
        (setq i (+ i 2))
        (while (and (<= i len) (not (= (substr raw i 1) ";")))
          (setq i (1+ i)))
        (setq i (1+ i)))
-      ;; Скобки группировки RTF
       ((member ch '("{" "}")) (setq i (1+ i)))
-      ;; Обычный символ
       (t (setq cur (strcat cur ch)) (setq i (1+ i)))))
   (if (> (strlen (ps:trim cur)) 0)
     (setq lines (append lines (list (ps:trim cur)))))
   lines)
 
-;;; Число → строка с запятой как десятичным разделителем (Excel RU)
+;;; Number to string with comma decimal (RU Excel)
 (defun ps:n2s (n)
   (vl-string-subst "," "." (rtos n 2 2)))
 
 ;;; ================================================================
-;;;  Работа с объектами AutoCAD
+;;;  AutoCAD entity helpers
 ;;; ================================================================
 
 (defun ps:etype (e) (cdr (assoc 0  (entget e))))
 (defun ps:bname (e) (cdr (assoc 2  (entget e))))
 (defun ps:ipt   (e) (cdr (assoc 10 (entget e))))
 
-;;; Все 2D вершины объекта (LINE, LWPOLYLINE, POLYLINE, INSERT)
+;;; All 2D vertices of LINE / LWPOLYLINE / POLYLINE / INSERT
 (defun ps:verts (e / ed et pts sub)
   (setq ed (entget e)  et (cdr (assoc 0 ed)))
   (cond
@@ -103,11 +89,10 @@
          (setq pts (append pts (list (cdr (assoc 10 (entget sub)))))))
        (setq sub (entnext sub)))
      pts)
-    ((= et "INSERT")
-     (list (cdr (assoc 10 ed))))
+    ((= et "INSERT") (list (cdr (assoc 10 ed))))
     (t nil)))
 
-;;; Центр (среднее) списка точек
+;;; Centroid of a point list
 (defun ps:center (pts / n sx sy)
   (if (null pts) nil
     (progn
@@ -115,12 +100,12 @@
       (foreach p pts (setq sx (+ sx (car p))  sy (+ sy (cadr p))))
       (list (/ sx n) (/ sy n) 0.0))))
 
-;;; Расстояние 2D
+;;; 2D distance
 (defun ps:d2 (a b)
   (sqrt (+ (expt (- (car  a) (car  b)) 2)
            (expt (- (cadr a) (cadr b)) 2))))
 
-;;; Есть ли хотя бы одна пара точек в допуске?
+;;; Any point pair within tolerance?
 (defun ps:touch? (v1 v2 tol / found)
   (setq found nil)
   (foreach a v1
@@ -129,10 +114,10 @@
   found)
 
 ;;; ================================================================
-;;;  Поиск MTEXT и парсинг
+;;;  MTEXT search and parsing
 ;;; ================================================================
 
-;;; Найти ближайший MTEXT в радиусе от точки, содержащий подстроку key
+;;; Find nearest MTEXT within radius containing substring key
 (defun ps:mtext-near (cen rad key / ss i e ed txt pt d best-d best-e)
   (setq best-d 1e10  best-e nil)
   (setq ss (ssget "_C"
@@ -154,8 +139,8 @@
         (setq i (1+ i)))))
   best-e)
 
-;;; Разобрать MTEXT блока оборудования → alist ((ключ . значение) ...)
-;;; Формат строк: «Ключ : Значение»
+;;; Parse equipment MTEXT -> alist ((key . value) ...)
+;;; Line format: "Key : Value"
 (defun ps:parse-mtext (e / lines line col k v result)
   (setq lines  (ps:mtext->lines (cdr (assoc 1 (entget e))))
         result nil)
@@ -168,7 +153,7 @@
         (setq result (append result (list (cons k v)))))))
   result)
 
-;;; Найти значение в alist по частичному совпадению ключа (без регистра)
+;;; Find value in alist by partial key match (case-insensitive ASCII fragment)
 (defun ps:find-val (frag alist / found)
   (setq found nil)
   (foreach p alist
@@ -177,11 +162,18 @@
       (setq found (cdr p))))
   found)
 
+;;; Find first value that starts with prefix (e.g. "ARUN", "ARNU")
+(defun ps:find-val-sw (prefix alist / found)
+  (setq found nil)
+  (foreach p alist
+    (if (and (null found) (ps:sw (cdr p) prefix))
+      (setq found (cdr p))))
+  found)
+
 ;;; ================================================================
-;;;  Работа с блоками: атрибуты, модель ВБ
+;;;  Block attributes and IDU model detection
 ;;; ================================================================
 
-;;; Получить все атрибуты блока → alist ((тег . значение) ...)
 (defun ps:get-attrs (e / sub ed result)
   (setq result nil  sub (entnext e))
   (while (and sub (= (ps:etype sub) "ATTRIB"))
@@ -192,7 +184,6 @@
     (setq sub (entnext sub)))
   result)
 
-;;; Найти значение атрибута, начинающееся с prefix
 (defun ps:attr-sw (e prefix / found)
   (setq found nil)
   (foreach p (ps:get-attrs e)
@@ -200,10 +191,7 @@
       (setq found (cdr p))))
   found)
 
-;;; Определить модель ВБ:
-;;;   1) атрибут, значение которого начинается с ARNU
-;;;   2) MTEXT рядом, содержащий ARNU
-;;;   3) имя блока
+;;; IDU model: 1) attribute starting ARNU  2) nearby MTEXT  3) block name
 (defun ps:vb-model (e bname / model me lines pos sub sp)
   (setq model (ps:attr-sw e "ARNU"))
   (if (null model)
@@ -224,11 +212,10 @@
   (if (and model (> (strlen model) 0)) model bname))
 
 ;;; ================================================================
-;;;  Поиск подписей трубы (диаметр выше / длина ниже)
+;;;  Pipe label search
 ;;; ================================================================
 
-;;; Текст диаметра: содержит «:», не содержит «/», не содержит «ID»,
-;;; находится выше центра линии
+;;; Diameter label: contains ":", no "/", no "ID", above center
 (defun ps:diam-above (cen rad / ss i e ed txt pt d best-d best)
   (setq best nil  best-d 1e10)
   (setq ss (ssget "_C"
@@ -254,7 +241,7 @@
         (setq i (1+ i)))))
   best)
 
-;;; Текст длины: содержит «/», находится ниже или на уровне центра линии
+;;; Length label: contains "/", below or at center Y
 (defun ps:len-below (cen rad / ss i e ed txt pt d best-d best)
   (setq best nil  best-d 1e10)
   (setq ss (ssget "_C"
@@ -276,7 +263,7 @@
         (setq i (1+ i)))))
   best)
 
-;;; Извлечь первое число из строки «X,X / Y m(N)» → вещественное
+;;; Extract first number from "X,X / Y m(N)"
 (defun ps:extract-len (s / pos)
   (if (null s) 0.0
     (progn
@@ -286,11 +273,9 @@
         0.0))))
 
 ;;; ================================================================
-;;;  BFS — трассировка системы от наружного блока
+;;;  BFS connectivity tracing
 ;;; ================================================================
 
-;;; pool — список entity-name кандидатов (LINE/POLY + ARBLN*/IAC*)
-;;; Возвращает список объектов, достижимых от start-ent
 (defun ps:bfs (start-ent pool tol / queue visited result cur cv cand cv2)
   (setq queue   (list start-ent)
         visited (list start-ent)
@@ -311,7 +296,7 @@
   result)
 
 ;;; ================================================================
-;;;  Накопление результатов
+;;;  Result accumulation
 ;;; ================================================================
 
 (defun ps:accum (key num lst / p)
@@ -323,7 +308,6 @@
   (setq p (assoc key lst))
   (if p (cdr p) 0.0))
 
-;;; Собрать все уникальные ключи из всех систем (сохраняя порядок)
 (defun ps:all-keys (results / keys)
   (setq keys nil)
   (foreach sys results
@@ -333,18 +317,16 @@
   keys)
 
 ;;; ================================================================
-;;;  Запись CSV
+;;;  CSV export
 ;;; ================================================================
 
 (defun ps:write-csv (path results all-keys / f hdr row total v)
   (setq f (open path "w"))
   (if (null f) nil
     (progn
-      ;; Строка заголовка
-      (setq hdr "Наименование")
+      (setq hdr "Name")
       (foreach sys results (setq hdr (strcat hdr ";" (car sys))))
-      (write-line (strcat hdr ";Итого") f)
-      ;; Строки данных
+      (write-line (strcat hdr ";Total") f)
       (foreach key all-keys
         (setq row key  total 0.0)
         (foreach sys results
@@ -356,7 +338,7 @@
       T)))
 
 ;;; ================================================================
-;;;  Главная команда PIPES_SYSTEM
+;;;  Main command: PIPES_SYSTEM
 ;;; ================================================================
 
 (defun C:PIPES_SYSTEM (/ ss i e ed bname ipt me parsed
@@ -365,13 +347,10 @@
                           etype everts cen diam lenstr lenval
                           imodel key results all-keys fname)
   (vl-load-com)
-  (princ "\n=== PIPES_SYSTEM v1.0 ===")
+  (princ "\n=== PIPES_SYSTEM v2.0 ===")
 
-  ;; ----------------------------------------------------------
-  ;; 1. Собрать пул объектов для трассировки:
-  ;;    линии + блоки ARBLN* и IAC*
-  ;; ----------------------------------------------------------
-  (princ "\nСбор объектов чертежа...")
+  ;; 1. Build pool: lines + ARBLN* + IAC* blocks
+  (princ "\nCollecting objects...")
   (setq pool nil)
 
   (setq ss (ssget "_X" '((0 . "LINE,LWPOLYLINE,POLYLINE"))))
@@ -390,12 +369,10 @@
           (setq pool (append pool (list e))))
         (setq i (1+ i)))))
 
-  (princ (strcat " найдено " (itoa (length pool)) " объектов."))
+  (princ (strcat " " (itoa (length pool)) " objects found."))
 
-  ;; ----------------------------------------------------------
-  ;; 2. Найти наружные блоки ARUN* и определить имена систем
-  ;; ----------------------------------------------------------
-  (princ "\nПоиск наружных блоков (ARUN*)...")
+  ;; 2. Find ODU blocks ARUN* -> system names
+  (princ "\nSearching ODU blocks (ARUN*)...")
   (setq systems nil)
 
   (setq ss (ssget "_X" '((0 . "INSERT"))))
@@ -406,30 +383,28 @@
         (if (ps:sw bname "ARUN")
           (progn
             (setq ipt (ps:ipt e))
-            ;; Ищем MTEXT с «ID» рядом с блоком
             (setq me (ps:mtext-near ipt *PS:MRAD* "ID"))
             (if me
               (progn
                 (setq parsed   (ps:parse-mtext me))
-                (setq sys-name (ps:find-val "ID"    parsed))
-                (setq model    (ps:find-val "одел" parsed)))
+                ;; System name: value after "ID" key
+                (setq sys-name (ps:find-val "ID" parsed))
+                ;; Model: first value starting with "ARUN"
+                (setq model    (ps:find-val-sw "ARUN" parsed)))
               (setq sys-name bname  model bname))
             (if (null sys-name) (setq sys-name bname))
             (if (null model)    (setq model    bname))
-            ;; (list имя-системы модель-НБ entity)
             (setq systems (append systems (list (list sys-name model e))))))
         (setq i (1+ i)))))
 
   (if (null systems)
     (progn
-      (alert "Блоки ARUN* не найдены!\nПроверьте чертёж.")
+      (alert "No ARUN* blocks found! Check drawing.")
       (exit)))
 
-  (princ (strcat " найдено " (itoa (length systems)) " систем."))
+  (princ (strcat " " (itoa (length systems)) " systems found."))
 
-  ;; ----------------------------------------------------------
-  ;; 3. Для каждой системы — трассировка и сбор данных
-  ;; ----------------------------------------------------------
+  ;; 3. Trace each system, collect data
   (setq results nil)
 
   (foreach sys systems
@@ -437,34 +412,27 @@
           model    (cadr  sys)
           e        (caddr sys))
 
-    (princ (strcat "\n  Трассировка: " sys-name " ..."))
+    (princ (strcat "\n  Tracing: " sys-name " ..."))
     (setq sys-ents (ps:bfs e pool *PS:TOL*))
-    (princ (strcat " " (itoa (length sys-ents)) " объектов."))
+    (princ (strcat " " (itoa (length sys-ents)) " objects."))
 
     (setq sys-data nil)
 
-    ;; НБ — всегда 1 штука
-    (setq sys-data (ps:accum (strcat "НБ " model) 1 sys-data))
+    ;; ODU: always 1
+    (setq sys-data (ps:accum (strcat "ODU " model) 1 sys-data))
 
     (foreach ent sys-ents
       (setq etype (ps:etype ent))
       (cond
-
-        ;; --- Блоки ---
         ((= etype "INSERT")
          (setq bname (ps:bname ent))
          (cond
-           ;; Рефнет ARBLN*
            ((ps:sw bname "ARBLN")
-            (setq key (strcat "Рефнет " bname))
-            (setq sys-data (ps:accum key 1 sys-data)))
-           ;; Внутренний блок IAC*
+            (setq sys-data (ps:accum (strcat "Refnet " bname) 1 sys-data)))
            ((ps:sw bname "IAC")
             (setq imodel (ps:vb-model ent bname))
-            (setq key (strcat "ВБ " imodel))
-            (setq sys-data (ps:accum key 1 sys-data)))))
+            (setq sys-data (ps:accum (strcat "IDU " imodel) 1 sys-data)))))
 
-        ;; --- Трубопроводы ---
         ((member etype '("LINE" "LWPOLYLINE" "POLYLINE"))
          (setq everts (ps:verts ent)
                cen    (ps:center everts))
@@ -476,32 +444,27 @@
                (progn
                  (setq lenval (ps:extract-len lenstr))
                  (if (> lenval 0.0)
-                   (progn
-                     (setq key (strcat "Труба " diam " м"))
-                     (setq sys-data (ps:accum key lenval sys-data)))))))))))
+                   (setq sys-data
+                     (ps:accum (strcat "Pipe " diam " m") lenval sys-data))))))))))
 
     (setq results (append results (list (list sys-name sys-data)))))
 
-  ;; ----------------------------------------------------------
-  ;; 4. Сохранить CSV
-  ;; ----------------------------------------------------------
+  ;; 4. Save CSV
   (setq all-keys (ps:all-keys results))
 
-  (setq fname (getfiled "Сохранить отчёт как CSV"
-                        (getvar "DWGPREFIX") "csv" 1))
+  (setq fname (getfiled "Save CSV report" (getvar "DWGPREFIX") "csv" 1))
   (if (null fname)
-    (progn (princ "\nОтменено.") (exit)))
+    (progn (princ "\nCancelled.") (exit)))
 
   (if (ps:write-csv fname results all-keys)
     (progn
-      (princ (strcat "\nГотово! Файл сохранён:\n" fname))
+      (princ (strcat "\nDone! File saved: " fname))
       (startapp "explorer" fname))
-    (alert "Ошибка при записи файла!"))
+    (alert "File write error!"))
 
-  (princ "\n=== PIPES_SYSTEM завершён ===")
+  (princ "\n=== PIPES_SYSTEM done ===")
   (princ))
 
 ;;; ================================================================
-(princ "\nPIPES_SYSTEM v1.0 загружен.")
-(princ "\nКоманда: PIPES_SYSTEM")
+(princ "\nPIPES_SYSTEM v2.0 loaded. Command: PIPES_SYSTEM")
 (princ)
