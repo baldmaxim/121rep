@@ -370,10 +370,10 @@
        (setq bname (cdr (assoc 2 ed)))
        (cond
          ;; Refnets + IDU -> pool
-         ((or (ps:sw bname "ARBLN") (ps:sw bname "IAC"))
+         ((or (ps:sw bname "LATS_SPLT") (ps:sw bname "LATS_IDU"))
           (setq pool (append pool (list e))))
          ;; ODU -> systems
-         ((ps:sw bname "ARUN")
+         ((ps:sw bname "LATS_ODU")
           (progn
             (setq ipt (cdr (assoc 10 ed)))
             (setq me (ps:mtext-near ipt *PS:MRAD* "ID"))
@@ -393,7 +393,7 @@
 
   (if (null systems)
     (progn
-      (alert "No ARUN* blocks in selection!")
+      (alert "No LATS_ODU* blocks in selection!")
       (exit)))
 
   (princ (strcat " " (itoa (length systems)) " systems found."))
@@ -421,9 +421,9 @@
         ((= etype "INSERT")
          (setq bname (ps:bname ent))
          (cond
-           ((ps:sw bname "ARBLN")
+           ((ps:sw bname "LATS_SPLT")
             (setq sys-data (ps:accum (strcat "Refnet " bname) 1 sys-data)))
-           ((ps:sw bname "IAC")
+           ((ps:sw bname "LATS_IDU")
             (setq imodel (ps:vb-model ent bname))
             (setq sys-data (ps:accum (strcat "IDU " imodel) 1 sys-data)))))
 
