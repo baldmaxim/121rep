@@ -208,7 +208,7 @@
                   (progn
                     (setq sub (substr line (1+ pos))
                           sp  (vl-string-search " " sub))
-                    (setq model (if sp (substr sub 1 sp) sub))))))))))))
+                    (setq model (if sp (substr sub 1 sp) sub)))))))))))
   (if (and model (> (strlen model) 0)) model bname))
 
 ;;; ================================================================
