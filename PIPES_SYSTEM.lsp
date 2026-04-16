@@ -348,58 +348,52 @@
                           imodel key results all-keys fname)
   (vl-load-com)
   (princ "\n=== PIPES_SYSTEM v2.0 ===")
+  (princ "\nSelect area with systems (window/crossing), then Enter: ")
 
-  ;; 1. Build pool: lines + ARBLN* + IAC* blocks
-  (princ "\nCollecting objects...")
-  (setq pool nil)
+  ;; 1. User selects objects in area
+  (setq ss (ssget))
+  (if (null ss)
+    (progn (princ "\nNo objects selected. Cancelled.") (exit)))
 
-  (setq ss (ssget "_X" '((0 . "LINE,LWPOLYLINE,POLYLINE"))))
-  (if ss
-    (progn (setq i 0)
-      (repeat (sslength ss)
-        (setq pool (append pool (list (ssname ss i))))
-        (setq i (1+ i)))))
-
-  (setq ss (ssget "_X" '((0 . "INSERT"))))
-  (if ss
-    (progn (setq i 0)
-      (repeat (sslength ss)
-        (setq e (ssname ss i)  bname (ps:bname e))
-        (if (or (ps:sw bname "ARBLN") (ps:sw bname "IAC"))
+  ;; 2. Split selection into pool + systems
+  (setq pool nil  systems nil  i 0)
+  (repeat (sslength ss)
+    (setq e     (ssname ss i)
+          ed    (entget e)
+          etype (cdr (assoc 0 ed)))
+    (cond
+      ;; Lines -> pool
+      ((member etype '("LINE" "LWPOLYLINE" "POLYLINE"))
+       (setq pool (append pool (list e))))
+      ;; Blocks
+      ((= etype "INSERT")
+       (setq bname (cdr (assoc 2 ed)))
+       (cond
+         ;; Refnets + IDU -> pool
+         ((or (ps:sw bname "ARBLN") (ps:sw bname "IAC"))
           (setq pool (append pool (list e))))
-        (setq i (1+ i)))))
-
-  (princ (strcat " " (itoa (length pool)) " objects found."))
-
-  ;; 2. Find ODU blocks ARUN* -> system names
-  (princ "\nSearching ODU blocks (ARUN*)...")
-  (setq systems nil)
-
-  (setq ss (ssget "_X" '((0 . "INSERT"))))
-  (if ss
-    (progn (setq i 0)
-      (repeat (sslength ss)
-        (setq e (ssname ss i)  bname (ps:bname e))
-        (if (ps:sw bname "ARUN")
+         ;; ODU -> systems
+         ((ps:sw bname "ARUN")
           (progn
-            (setq ipt (ps:ipt e))
+            (setq ipt (cdr (assoc 10 ed)))
             (setq me (ps:mtext-near ipt *PS:MRAD* "ID"))
             (if me
               (progn
                 (setq parsed   (ps:parse-mtext me))
-                ;; System name: value after "ID" key
                 (setq sys-name (ps:find-val "ID" parsed))
-                ;; Model: first value starting with "ARUN"
                 (setq model    (ps:find-val-sw "ARUN" parsed)))
               (setq sys-name bname  model bname))
             (if (null sys-name) (setq sys-name bname))
             (if (null model)    (setq model    bname))
-            (setq systems (append systems (list (list sys-name model e))))))
-        (setq i (1+ i)))))
+            (setq systems (append systems (list (list sys-name model e)))))))))
+    (setq i (1+ i)))
+
+  (princ (strcat "\n" (itoa (length pool)) " objects, "
+                 (itoa (length systems)) " systems in selection."))
 
   (if (null systems)
     (progn
-      (alert "No ARUN* blocks found! Check drawing.")
+      (alert "No ARUN* blocks in selection!")
       (exit)))
 
   (princ (strcat " " (itoa (length systems)) " systems found."))
