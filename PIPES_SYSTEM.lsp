@@ -14,9 +14,9 @@
 (vl-load-com)
 
 ;;; ---- Settings ----
-(setq *PS:TOL*   3.0)    ; connection tolerance (drawing units)
-(setq *PS:MRAD* 600.0)   ; MTEXT search radius near equipment block
-(setq *PS:PRAD* 200.0)   ; pipe label search radius
+(setq *PS:TOL*   100.0)   ; connection tolerance (mm)
+(setq *PS:MRAD* 5000.0)  ; MTEXT search radius near equipment block (mm)
+(setq *PS:PRAD* 1000.0)  ; pipe label search radius (mm)
 
 ;;; ================================================================
 ;;;  String utilities
