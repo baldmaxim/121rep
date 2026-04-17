@@ -1,9 +1,6 @@
 ;;; =============================================================
-;;; PIPES_SYSTEM.lsp  v3.2
-;;; HVAC refrigerant system analyzer for AutoCAD
-;;;
-;;; Select area -> finds ODU/IDU/Refnets/Pipes -> CSV
-;;; Pipes detected from TEXT labels, no line tracing.
+;;; PIPES_SYSTEM.lsp  v4.0
+;;; HVAC system analyzer — connectivity via lines
 ;;;
 ;;; Command: PIPES_SYSTEM
 ;;; =============================================================
@@ -12,6 +9,8 @@
 
 (setq *PS:MRAD* 5000.0)  ; MTEXT search radius (mm)
 (setq *PS:DRAD* 1000.0)  ; diameter label search radius (mm)
+(setq *PS:BCON*  500.0)  ; block-to-line connection radius (mm)
+(setq *PS:LTOL*   50.0)  ; line-to-line endpoint tolerance (mm)
 
 ;;; ================================================================
 ;;;  String utilities
@@ -29,41 +28,33 @@
   (and (>= (strlen s) (strlen pfx))
        (= (strcase (substr s 1 (strlen pfx))) (strcase pfx))))
 
-;;; Parse MTEXT: strip RTF, split by \P and real newlines
 (defun ps:mtext->lines (raw / lines cur i len ch code)
   (setq raw (if raw raw "")
         lines nil  cur ""  i 1  len (strlen raw))
   (while (<= i len)
-    (setq ch (substr raw i 1)
-          code (ascii ch))
+    (setq ch (substr raw i 1)  code (ascii ch))
     (cond
-      ;; Real newline chars (10=LF, 13=CR)
       ((or (= code 10) (= code 13))
        (if (> (strlen (ps:trim cur)) 0)
          (setq lines (append lines (list (ps:trim cur)))))
        (setq cur ""  i (1+ i)))
-      ;; \P or \n paragraph break
       ((and (= ch "\\") (<= (1+ i) len)
             (member (strcase (substr raw (1+ i) 1)) '("P" "N")))
        (if (> (strlen (ps:trim cur)) 0)
          (setq lines (append lines (list (ps:trim cur)))))
        (setq cur ""  i (+ i 2)))
-      ;; RTF code \X...;
       ((and (= ch "\\") (<= (1+ i) len)
             (not (member (strcase (substr raw (1+ i) 1)) '("P" "N" "~"))))
        (setq i (+ i 2))
        (while (and (<= i len) (not (= (substr raw i 1) ";")))
          (setq i (1+ i)))
        (setq i (1+ i)))
-      ;; RTF braces
       ((member ch '("{" "}")) (setq i (1+ i)))
-      ;; Normal char
       (t (setq cur (strcat cur ch)) (setq i (1+ i)))))
   (if (> (strlen (ps:trim cur)) 0)
     (setq lines (append lines (list (ps:trim cur)))))
   lines)
 
-;;; Number -> string with comma (RU Excel)
 (defun ps:n2s (n)
   (vl-string-subst "," "." (rtos n 2 2)))
 
@@ -77,6 +68,41 @@
 (defun ps:d2 (a b)
   (sqrt (+ (expt (- (car a) (car b)) 2)
            (expt (- (cadr a) (cadr b)) 2))))
+
+;;; Line/poly endpoints
+(defun ps:line-pts (e / ed et pts sub)
+  (setq ed (entget e)  et (cdr (assoc 0 ed)))
+  (cond
+    ((= et "LINE")
+     (list (cdr (assoc 10 ed)) (cdr (assoc 11 ed))))
+    ((= et "LWPOLYLINE")
+     (setq pts nil)
+     (foreach pair ed
+       (if (= (car pair) 10)
+         (setq pts (append pts (list (cdr pair))))))
+     pts)
+    ((= et "POLYLINE")
+     (setq pts nil  sub (entnext e))
+     (while (and sub (not (= (ps:etype sub) "SEQEND")))
+       (if (= (ps:etype sub) "VERTEX")
+         (setq pts (append pts (list (cdr (assoc 10 (entget sub)))))))
+       (setq sub (entnext sub)))
+     pts)
+    (t nil)))
+
+;;; Connection points for BFS:
+;;;   Lines -> actual endpoints
+;;;   Blocks -> all line endpoints within *PS:BCON* of insertion point
+(defun ps:conn-pts (e all-lpts / ed et ipt pts)
+  (setq ed (entget e)  et (cdr (assoc 0 ed)))
+  (if (= et "INSERT")
+    (progn
+      (setq ipt (cdr (assoc 10 ed))  pts nil)
+      (foreach p all-lpts
+        (if (<= (ps:d2 ipt p) *PS:BCON*)
+          (setq pts (append pts (list p)))))
+      (if (null pts) (list ipt) pts))
+    (ps:line-pts e)))
 
 ;;; ================================================================
 ;;;  MTEXT parsing
@@ -131,7 +157,7 @@
   found)
 
 ;;; ================================================================
-;;;  Block attributes + IDU model
+;;;  Block attributes + model detection
 ;;; ================================================================
 
 (defun ps:get-attrs (e / sub ed result)
@@ -151,7 +177,6 @@
       (setq found (cdr p))))
   found)
 
-;;; Extract clean model: only alphanumeric chars
 (defun ps:clean-model (s / i ch result)
   (setq result ""  i 1)
   (while (<= i (strlen s))
@@ -164,7 +189,7 @@
     (setq i (1+ i)))
   result)
 
-;;; IDU model: attribute ARNU* -> nearby MTEXT ARNU* -> block name
+;;; IDU model
 (defun ps:vb-model (e bname / model me lines pos sub)
   (setq model (ps:attr-sw e "ARNU"))
   (if (null model)
@@ -181,7 +206,7 @@
                   (setq model (ps:clean-model (substr line (1+ pos))))))))))))
   (if (and model (> (strlen model) 0)) model bname))
 
-;;; Find nearest TEXT/MTEXT containing keyword near point
+;;; Find nearest TEXT/MTEXT containing keyword
 (defun ps:text-near (cen rad key / ss i e ed txt pt d best-d best)
   (setq best nil  best-d 1e10)
   (setq ss (ssget "_C"
@@ -203,46 +228,59 @@
         (setq i (1+ i)))))
   best)
 
-;;; Refnet model: find TEXT "ARBLN*" near block -> clean name
+;;; Refnet model from nearby TEXT ARBLN*
 (defun ps:refnet-model (e bname / txt)
   (setq txt (ps:text-near (ps:ipt e) *PS:MRAD* "ARBLN"))
   (if (and txt (> (strlen txt) 0))
     (ps:clean-model txt)
     bname))
 
-;;; Split "6,35:12,7" -> ("6,35" "12,7")
-(defun ps:split-diams (s / pos)
-  (setq pos (vl-string-search ":" s))
-  (if pos
-    (list (ps:trim (substr s 1 pos))
-          (ps:trim (substr s (+ pos 2))))
-    (list (ps:trim s))))
-
-;;; Sort keys: ODU -> IDU -> Refnet -> Pipe
-(defun ps:sort-keys (keys / odu idu ref pipe)
-  (setq odu nil  idu nil  ref nil  pipe nil)
-  (foreach k keys
-    (cond
-      ((ps:sw k "ODU")    (setq odu  (append odu  (list k))))
-      ((ps:sw k "IDU")    (setq idu  (append idu  (list k))))
-      ((ps:sw k "Refnet") (setq ref  (append ref  (list k))))
-      (t                  (setq pipe (append pipe (list k))))))
-  (append odu idu ref pipe))
-
 ;;; ================================================================
-;;;  Nearest ODU system
+;;;  BFS through connected entities
 ;;; ================================================================
 
-(defun ps:nearest-sys (pt systems / d best-d best-name)
-  (setq best-d 1e10  best-name nil)
-  (foreach sys systems
-    (setq d (ps:d2 pt (cadddr sys)))
-    (if (< d best-d)
-      (setq best-d d  best-name (car sys))))
-  best-name)
+;;; Precompute connection points for all pool entities
+;;; Returns: ((entity . points-list) ...)
+(defun ps:precompute-cp (pool all-lpts / result)
+  (setq result nil)
+  (foreach e pool
+    (setq result (cons (cons e (ps:conn-pts e all-lpts)) result)))
+  result)
+
+;;; BFS from start-pts through precomputed pool
+;;; Returns list of reached entities
+(defun ps:bfs (start-pts pool-cp tol / queue visited result
+                ent pts found cur-pts)
+  (setq visited nil  result nil  queue nil)
+  ;; Initial connections
+  (foreach item pool-cp
+    (setq ent (car item)  pts (cdr item)  found nil)
+    (foreach sp start-pts
+      (foreach ep pts
+        (if (<= (ps:d2 sp ep) tol) (setq found T))))
+    (if found
+      (setq visited (cons ent visited)
+            result  (cons ent result)
+            queue   (cons pts queue))))
+  ;; BFS loop
+  (while queue
+    (setq cur-pts (car queue)  queue (cdr queue))
+    (foreach item pool-cp
+      (setq ent (car item)  pts (cdr item))
+      (if (not (member ent visited))
+        (progn
+          (setq found nil)
+          (foreach p1 cur-pts
+            (foreach p2 pts
+              (if (<= (ps:d2 p1 p2) tol) (setq found T))))
+          (if found
+            (setq visited (cons ent visited)
+                  result  (cons ent result)
+                  queue   (cons pts queue)))))))
+  result)
 
 ;;; ================================================================
-;;;  Find diameter label nearest to a point (contains ":", no "/")
+;;;  Pipe labels
 ;;; ================================================================
 
 (defun ps:find-diam-near (cen rad / ss i e ed txt pt d best-d best)
@@ -271,7 +309,6 @@
         (setq i (1+ i)))))
   best)
 
-;;; Extract first number from "X,X / Y m(N)"
 (defun ps:extract-len (s / pos)
   (if (null s) 0.0
     (progn
@@ -279,6 +316,13 @@
       (if pos
         (atof (vl-string-subst "." "," (ps:trim (substr s 1 pos))))
         0.0))))
+
+(defun ps:split-diams (s / pos)
+  (setq pos (vl-string-search ":" s))
+  (if pos
+    (list (ps:trim (substr s 1 pos))
+          (ps:trim (substr s (+ pos 2))))
+    (list (ps:trim s))))
 
 ;;; ================================================================
 ;;;  Accumulator + CSV
@@ -301,6 +345,16 @@
         (setq keys (append keys (list (car p)))))))
   keys)
 
+(defun ps:sort-keys (keys / odu idu ref pipe)
+  (setq odu nil  idu nil  ref nil  pipe nil)
+  (foreach k keys
+    (cond
+      ((ps:sw k "ODU")    (setq odu  (append odu  (list k))))
+      ((ps:sw k "IDU")    (setq idu  (append idu  (list k))))
+      ((ps:sw k "Refnet") (setq ref  (append ref  (list k))))
+      (t                  (setq pipe (append pipe (list k))))))
+  (append odu idu ref pipe))
+
 (defun ps:write-csv (path results all-keys / f hdr row total v)
   (setq f (open path "w"))
   (if (null f) nil
@@ -318,122 +372,162 @@
       (close f)
       T)))
 
-;;; Helper: update sys-data-map for a system
-(defun ps:map-accum (smap sname key num)
-  (mapcar (function (lambda (sd)
-    (if (= (car sd) sname)
-      (list sname (ps:accum key num (cadr sd)))
-      sd)))
-    smap))
-
 ;;; ================================================================
-;;;  Main command: PIPES_SYSTEM
+;;;  Main command
 ;;; ================================================================
 
 (defun C:PIPES_SYSTEM (/ ss i e ed etype bname ipt me parsed
-                          sys-name model systems sys-data-map
-                          nearest imodel key txt pt
-                          diam lenval results all-keys fname)
+                          sys-name model systems
+                          pool all-lpts pool-cp odu-pts reached
+                          sys-lines-map sys-data-map
+                          imodel key txt pt diam lenval d
+                          best-sys best-d line-sys
+                          results all-keys fname)
   (vl-load-com)
-  (princ "\n=== PIPES_SYSTEM v3.2 ===")
-  (princ "\nSelect area with systems, then Enter: ")
+  (princ "\n=== PIPES_SYSTEM v4.0 ===")
+  (princ "\nSelect area, then Enter: ")
 
   (setq ss (ssget))
   (if (null ss)
     (progn (princ "\nCancelled.") (exit)))
   (princ (strcat "\n" (itoa (sslength ss)) " objects selected."))
 
-  ;; ---- Pass 1: find ODU blocks ----
-  (setq systems nil  i 0)
+  ;; ---- Pass 1: find ODU + build pool ----
+  (setq systems nil  pool nil  i 0)
   (repeat (sslength ss)
     (setq e  (ssname ss i)
-          ed (entget e))
-    (if (and (= (cdr (assoc 0 ed)) "INSERT")
-             (ps:sw (cdr (assoc 2 ed)) "LATS_ODU"))
-      (progn
-        (setq ipt (cdr (assoc 10 ed)))
-        (setq me (ps:mtext-near ipt *PS:MRAD* "ID"))
-        (if me
-          (progn
-            (setq parsed   (ps:parse-mtext me))
-            (setq sys-name (ps:find-val "ID" parsed))
-            (setq model    (ps:find-val-sw "ARUN" parsed)))
-          (setq sys-name nil  model nil))
-        (if (null sys-name) (setq sys-name (cdr (assoc 2 ed))))
-        (if (null model)    (setq model    (cdr (assoc 2 ed))))
-        ;; (name model ent point)
-        (setq systems (append systems
-                (list (list sys-name model e ipt))))))
+          ed (entget e)
+          etype (cdr (assoc 0 ed)))
+    (cond
+      ;; Lines -> pool
+      ((member etype '("LINE" "LWPOLYLINE" "POLYLINE"))
+       (setq pool (cons e pool)))
+      ;; Blocks
+      ((= etype "INSERT")
+       (setq bname (cdr (assoc 2 ed)))
+       (cond
+         ;; ODU -> systems
+         ((ps:sw bname "LATS_ODU")
+          (setq ipt (cdr (assoc 10 ed)))
+          (setq me (ps:mtext-near ipt *PS:MRAD* "ID"))
+          (if me
+            (progn
+              (setq parsed   (ps:parse-mtext me))
+              (setq sys-name (ps:find-val "ID" parsed))
+              (setq model    (ps:find-val-sw "ARUN" parsed)))
+            (setq sys-name nil  model nil))
+          (if (null sys-name) (setq sys-name bname))
+          (if (null model)    (setq model bname))
+          (setq systems (cons (list sys-name model e ipt) systems)))
+         ;; IDU + Refnet -> pool
+         ((or (ps:sw bname "LATS_IDU") (ps:sw bname "LATS_SPLT"))
+          (setq pool (cons e pool))))))
     (setq i (1+ i)))
 
   (if (null systems)
     (progn (alert "No LATS_ODU* in selection!") (exit)))
-  (princ (strcat "\n" (itoa (length systems)) " systems."))
+  (princ (strcat "\n" (itoa (length systems)) " systems, "
+                 (itoa (length pool)) " pool objects."))
 
-  ;; Init data map
+  ;; ---- Collect all line endpoints + precompute ----
+  (setq all-lpts nil)
+  (foreach e pool
+    (if (member (ps:etype e) '("LINE" "LWPOLYLINE" "POLYLINE"))
+      (setq all-lpts (append all-lpts (ps:line-pts e)))))
+
+  (princ (strcat "\n" (itoa (length all-lpts)) " line endpoints."))
+  (setq pool-cp (ps:precompute-cp pool all-lpts))
+
+  ;; ---- BFS from each ODU ----
+  ;; sys-lines-map: ((sys-name . reached-entities) ...)
+  (setq sys-lines-map nil)
   (setq sys-data-map nil)
-  (foreach sys systems
-    (setq sys-data-map
-      (append sys-data-map
-        (list (list (car sys)
-                (list (cons (strcat "ODU " (cadr sys)) 1)))))))
 
-  ;; ---- Pass 2: classify blocks + text ----
+  (foreach sys systems
+    (setq sys-name (car sys)
+          model    (cadr sys)
+          ipt      (cadddr sys))
+    (princ (strcat "\n  BFS: " sys-name "..."))
+
+    ;; ODU connect points = line endpoints near ODU
+    (setq odu-pts (ps:conn-pts (caddr sys) all-lpts))
+    ;; BFS through pool
+    (setq reached (ps:bfs odu-pts pool-cp *PS:LTOL*))
+    (princ (strcat " " (itoa (length reached)) " connected."))
+
+    (setq sys-lines-map (cons (cons sys-name reached) sys-lines-map))
+
+    ;; Init system data with ODU
+    (setq sys-data-map
+      (cons (list sys-name (list (cons (strcat "ODU " model) 1)))
+            sys-data-map)))
+
+  ;; ---- Process reached entities per system ----
+  (foreach slm sys-lines-map
+    (setq sys-name (car slm))
+    (foreach e (cdr slm)
+      (setq etype (ps:etype e)
+            bname (if (= etype "INSERT") (cdr (assoc 2 (entget e))) nil))
+      (cond
+        ;; IDU
+        ((and bname (ps:sw bname "LATS_IDU"))
+         (setq imodel (ps:vb-model e bname))
+         (setq sys-data-map
+           (mapcar (function (lambda (sd)
+             (if (= (car sd) sys-name)
+               (list sys-name (ps:accum (strcat "IDU " imodel) 1 (cadr sd)))
+               sd)))
+             sys-data-map)))
+        ;; Refnet
+        ((and bname (ps:sw bname "LATS_SPLT"))
+         (setq imodel (ps:refnet-model e bname))
+         (setq sys-data-map
+           (mapcar (function (lambda (sd)
+             (if (= (car sd) sys-name)
+               (list sys-name (ps:accum (strcat "Refnet " imodel) 1 (cadr sd)))
+               sd)))
+             sys-data-map))))))
+
+  ;; ---- Process text labels -> assign to system by nearest reached line ----
   (setq i 0)
   (repeat (sslength ss)
-    (setq e     (ssname ss i)
-          ed    (entget e)
+    (setq e  (ssname ss i)
+          ed (entget e)
           etype (cdr (assoc 0 ed)))
-    (cond
-
-      ;; IDU blocks
-      ((and (= etype "INSERT")
-            (ps:sw (cdr (assoc 2 ed)) "LATS_IDU"))
-       (setq bname (cdr (assoc 2 ed))
-             ipt   (cdr (assoc 10 ed))
-             nearest (ps:nearest-sys ipt systems))
-       (if nearest
-         (progn
-           (setq imodel (ps:vb-model e bname))
-           (setq sys-data-map
-             (ps:map-accum sys-data-map nearest
-               (strcat "IDU " imodel) 1)))))
-
-      ;; Refnet blocks -> find ARBLN* model from nearby text
-      ((and (= etype "INSERT")
-            (ps:sw (cdr (assoc 2 ed)) "LATS_SPLT"))
-       (setq bname (cdr (assoc 2 ed))
-             ipt   (cdr (assoc 10 ed))
-             nearest (ps:nearest-sys ipt systems))
-       (if nearest
-         (progn
-           (setq imodel (ps:refnet-model e bname))
-           (setq sys-data-map
-             (ps:map-accum sys-data-map nearest
-               (strcat "Refnet " imodel) 1)))))
-
-      ;; TEXT/MTEXT with "/" -> pipe length label
-      ((and (member etype '("TEXT" "MTEXT"))
-            (setq txt (cdr (assoc 1 ed)))
-            (vl-string-search "/" txt)
-            (null (vl-string-search "kW" txt))
-            (null (vl-string-search "kg" txt)))
-       (setq pt  (cdr (assoc 10 ed))
-             nearest (ps:nearest-sys pt systems))
-       (if nearest
-         (progn
-           (setq diam (ps:find-diam-near pt *PS:DRAD*))
-           (setq lenval (ps:extract-len txt))
-           (if (and diam (> lenval 0.0))
-             ;; Split "6,35:12,7" -> accumulate each diameter separately
-             (foreach d (ps:split-diams diam)
-               (setq sys-data-map
-                 (ps:map-accum sys-data-map nearest
-                   (strcat "Pipe d" d " m") lenval))))))))
-
+    (if (and (member etype '("TEXT" "MTEXT"))
+             (setq txt (cdr (assoc 1 ed)))
+             (vl-string-search "/" txt)
+             (null (vl-string-search "kW" txt))
+             (null (vl-string-search "kg" txt)))
+      (progn
+        (setq pt (cdr (assoc 10 ed)))
+        ;; Find which system has the nearest reached line
+        (setq best-sys nil  best-d 1e10)
+        (foreach slm sys-lines-map
+          (foreach re (cdr slm)
+            (if (member (ps:etype re) '("LINE" "LWPOLYLINE" "POLYLINE"))
+              (progn
+                (foreach lp (ps:line-pts re)
+                  (setq d (ps:d2 pt lp))
+                  (if (< d best-d)
+                    (setq best-d d  best-sys (car slm))))))))
+        ;; Accumulate pipe data
+        (if best-sys
+          (progn
+            (setq diam (ps:find-diam-near pt *PS:DRAD*))
+            (setq lenval (ps:extract-len txt))
+            (if (and diam (> lenval 0.0))
+              (foreach dd (ps:split-diams diam)
+                (setq sys-data-map
+                  (mapcar (function (lambda (sd)
+                    (if (= (car sd) best-sys)
+                      (list best-sys
+                        (ps:accum (strcat "Pipe d" dd " m") lenval (cadr sd)))
+                      sd)))
+                    sys-data-map))))))))
     (setq i (1+ i)))
 
-  ;; ---- Results ----
+  ;; ---- CSV ----
   (setq results sys-data-map)
   (foreach sys results
     (princ (strcat "\n  " (car sys) ": "
@@ -453,5 +547,5 @@
   (princ))
 
 ;;; ================================================================
-(princ "\nPIPES_SYSTEM v3.2 loaded. Command: PIPES_SYSTEM")
+(princ "\nPIPES_SYSTEM v4.0 loaded. Command: PIPES_SYSTEM")
 (princ)
