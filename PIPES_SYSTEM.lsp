@@ -1,5 +1,5 @@
 ;;; =============================================================
-;;; PIPES_SYSTEM.lsp  v3.1
+;;; PIPES_SYSTEM.lsp  v3.2
 ;;; HVAC refrigerant system analyzer for AutoCAD
 ;;;
 ;;; Select area -> finds ODU/IDU/Refnets/Pipes -> CSV
@@ -181,6 +181,54 @@
                   (setq model (ps:clean-model (substr line (1+ pos))))))))))))
   (if (and model (> (strlen model) 0)) model bname))
 
+;;; Find nearest TEXT/MTEXT containing keyword near point
+(defun ps:text-near (cen rad key / ss i e ed txt pt d best-d best)
+  (setq best nil  best-d 1e10)
+  (setq ss (ssget "_C"
+             (list (- (car cen) rad) (- (cadr cen) rad) -9e9)
+             (list (+ (car cen) rad) (+ (cadr cen) rad)  9e9)))
+  (if ss
+    (progn
+      (setq i 0)
+      (repeat (sslength ss)
+        (setq e (ssname ss i)  ed (entget e))
+        (if (member (cdr (assoc 0 ed)) '("TEXT" "MTEXT"))
+          (progn
+            (setq txt (cdr (assoc 1 ed))
+                  pt  (cdr (assoc 10 ed)))
+            (if (and txt (vl-string-search key txt))
+              (progn
+                (setq d (ps:d2 cen pt))
+                (if (< d best-d) (setq best-d d  best (ps:trim txt)))))))
+        (setq i (1+ i)))))
+  best)
+
+;;; Refnet model: find TEXT "ARBLN*" near block -> clean name
+(defun ps:refnet-model (e bname / txt)
+  (setq txt (ps:text-near (ps:ipt e) *PS:MRAD* "ARBLN"))
+  (if (and txt (> (strlen txt) 0))
+    (ps:clean-model txt)
+    bname))
+
+;;; Split "6,35:12,7" -> ("6,35" "12,7")
+(defun ps:split-diams (s / pos)
+  (setq pos (vl-string-search ":" s))
+  (if pos
+    (list (ps:trim (substr s 1 pos))
+          (ps:trim (substr s (+ pos 2))))
+    (list (ps:trim s))))
+
+;;; Sort keys: ODU -> IDU -> Refnet -> Pipe
+(defun ps:sort-keys (keys / odu idu ref pipe)
+  (setq odu nil  idu nil  ref nil  pipe nil)
+  (foreach k keys
+    (cond
+      ((ps:sw k "ODU")    (setq odu  (append odu  (list k))))
+      ((ps:sw k "IDU")    (setq idu  (append idu  (list k))))
+      ((ps:sw k "Refnet") (setq ref  (append ref  (list k))))
+      (t                  (setq pipe (append pipe (list k))))))
+  (append odu idu ref pipe))
+
 ;;; ================================================================
 ;;;  Nearest ODU system
 ;;; ================================================================
@@ -287,7 +335,7 @@
                           nearest imodel key txt pt
                           diam lenval results all-keys fname)
   (vl-load-com)
-  (princ "\n=== PIPES_SYSTEM v3.1 ===")
+  (princ "\n=== PIPES_SYSTEM v3.2 ===")
   (princ "\nSelect area with systems, then Enter: ")
 
   (setq ss (ssget))
@@ -351,16 +399,18 @@
              (ps:map-accum sys-data-map nearest
                (strcat "IDU " imodel) 1)))))
 
-      ;; Refnet blocks
+      ;; Refnet blocks -> find ARBLN* model from nearby text
       ((and (= etype "INSERT")
             (ps:sw (cdr (assoc 2 ed)) "LATS_SPLT"))
        (setq bname (cdr (assoc 2 ed))
              ipt   (cdr (assoc 10 ed))
              nearest (ps:nearest-sys ipt systems))
        (if nearest
-         (setq sys-data-map
-           (ps:map-accum sys-data-map nearest
-             (strcat "Refnet " bname) 1))))
+         (progn
+           (setq imodel (ps:refnet-model e bname))
+           (setq sys-data-map
+             (ps:map-accum sys-data-map nearest
+               (strcat "Refnet " imodel) 1)))))
 
       ;; TEXT/MTEXT with "/" -> pipe length label
       ((and (member etype '("TEXT" "MTEXT"))
@@ -372,13 +422,14 @@
              nearest (ps:nearest-sys pt systems))
        (if nearest
          (progn
-           ;; Find diameter label nearby
            (setq diam (ps:find-diam-near pt *PS:DRAD*))
            (setq lenval (ps:extract-len txt))
            (if (and diam (> lenval 0.0))
-             (setq sys-data-map
-               (ps:map-accum sys-data-map nearest
-                 (strcat "Pipe " diam " m") lenval)))))))
+             ;; Split "6,35:12,7" -> accumulate each diameter separately
+             (foreach d (ps:split-diams diam)
+               (setq sys-data-map
+                 (ps:map-accum sys-data-map nearest
+                   (strcat "Pipe d" d " m") lenval))))))))
 
     (setq i (1+ i)))
 
@@ -388,7 +439,7 @@
     (princ (strcat "\n  " (car sys) ": "
                    (itoa (length (cadr sys))) " items")))
 
-  (setq all-keys (ps:all-keys results))
+  (setq all-keys (ps:sort-keys (ps:all-keys results)))
   (setq fname (getfiled "Save CSV" (getvar "DWGPREFIX") "csv" 1))
   (if (null fname)
     (progn (princ "\nCancelled.") (exit)))
@@ -402,5 +453,5 @@
   (princ))
 
 ;;; ================================================================
-(princ "\nPIPES_SYSTEM v3.1 loaded. Command: PIPES_SYSTEM")
+(princ "\nPIPES_SYSTEM v3.2 loaded. Command: PIPES_SYSTEM")
 (princ)
